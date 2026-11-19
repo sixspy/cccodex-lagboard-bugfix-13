@@ -58,11 +58,21 @@ createApp({
     const token=ref(localStorage.getItem('lagboard_token')||'');
     const user=ref(localStorage.getItem('lagboard_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
-    const sources=ref([]), arrivals=ref([]), catchups=ref([]);
+    const sources=ref([]), arrivals=ref([]), catchups=ref([]), events=ref([]);
     const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
     const nav=['到达登记','滞后分级','补齐恢复'];
     const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
     const degraded=computed(()=>sources.value.filter(s=>s.output_mode==='降级只读').length);
+    // 编排画布与源目录牌同树：只认 /api/sources 这一棵树，按 parent_id 排父子，禁止第二套连线
+    const tree=computed(()=>{
+      const byId={}; sources.value.forEach(s=>byId[s.id]={...s,children:[]});
+      const roots=[];
+      sources.value.forEach(s=>{
+        if(s.parent_id && byId[s.parent_id]) byId[s.parent_id].children.push(byId[s.id]);
+        else roots.push(byId[s.id]);
+      });
+      return roots;
+    });
     function modeClass(m){return m==='冻结'?'bad':(m==='降级只读'?'warn':'ok');}
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
@@ -88,6 +98,8 @@ createApp({
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const e=await loadJson('/api/freeze-events'); if(e===null) return;
+      events.value=Array.isArray(e.items)?e.items:[];
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
     }
     async function recordArrival(){
@@ -96,9 +108,19 @@ createApp({
       const j=await r.json(); actionErr.value=r.ok?(`滞后 ${j.lag_minutes} 分 · ${j.level} · ${j.output_mode}`):(j.detail||'失败');
       await refresh();
     }
-    async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
+    async function doCutoff(name){
+      actionErr.value='';
+      const r=await fetch('/api/cutoff/'+encodeURIComponent(name),{method:'POST',headers:auth()});
+      const j=await r.json(); actionErr.value=r.ok?(`已封档（甲路径）：${j.card.affected}`):(j.detail||'失败');
+      await refresh();
+    }
+    async function doCatchup(name){
+      const r=await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});
+      const j=await r.json().catch(()=>({})); if(!r.ok){actionErr.value=j.detail||'补齐被拒';}
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,events,form,actionErr,frozen,degraded,modeClass,tree,login,logout,recordArrival,doCutoff,doCatchup};
   },
   template:`
   <div v-if="!token" class="login">
@@ -111,10 +133,14 @@ createApp({
     <aside>
       <h1>源到达SLA</h1>
       <p>左侧是各源当前输出态；右侧登记到达并做补齐恢复。</p>
-      <div class="src" v-for="s in sources" :key="s.id">
+      <div class="src" v-for="s in tree" :key="s.id">
         <b>{{s.name}}</b>
         <span>SLA {{s.sla_minutes}} 分钟</span>
         <div class="mode" :class="modeClass(s.output_mode)">{{s.output_mode}}</div>
+        <div v-for="ch in s.children" :key="ch.id" style="margin:8px 0 0 14px;border-left:2px solid #274872;padding-left:10px">
+          <b style="font-size:13px">└ {{ch.name}}</b>
+          <div class="mode" :class="modeClass(ch.output_mode)" style="margin-top:4px">{{ch.output_mode}}</div>
+        </div>
       </div>
       <div style="margin-top:18px;font-size:12px;color:#9db0cc">{{user}} · <a href="#" style="color:#fff" @click.prevent="logout">退出</a></div>
     </aside>
@@ -144,18 +170,33 @@ createApp({
         </div>
       </div>
       <div class="card" v-show="tab===1">
-        <h3>分级规则</h3>
-        <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。</p>
-        <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th></th></tr></thead>
-        <tbody><tr v-for="s in sources" :key="'g'+s.id">
-          <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td>
-          <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
-        </tr></tbody></table>
+        <h3>分级规则与中断切断</h3>
+        <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。违约即按甲路径把父子冻进同一锁事务，遇挫父子同撤；封档当天不许改口。</p>
+        <table><thead><tr><th>源（父子同树）</th><th>SLA</th><th>输出态</th><th>操作</th></tr></thead>
+        <tbody>
+          <template v-for="s in tree" :key="'g'+s.id">
+            <tr>
+              <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td>
+              <td>
+                <button class="ghost" @click="doCutoff(s.name)" :disabled="s.output_mode==='冻结'">中断切断</button>
+                <button class="ghost" @click="doCatchup(s.name)">补齐恢复</button>
+              </td>
+            </tr>
+            <tr v-for="ch in s.children" :key="'c'+ch.id">
+              <td style="padding-left:22px;color:#64748b">└ {{ch.name}}</td><td>{{ch.sla_minutes}}</td><td>{{ch.output_mode}}</td>
+              <td><button class="ghost" @click="doCatchup(ch.name)">补齐恢复</button></td>
+            </tr>
+          </template>
+        </tbody></table>
       </div>
       <div class="card" v-show="tab===2">
         <h3>补齐记录</h3>
         <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
         <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <h3 style="margin-top:18px">任务附页 · 中断专册（只追加）</h3>
+        <table><thead><tr><th>类别</th><th>根源</th><th>说明</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="e in events" :key="e.id"><td>{{e.kind}}</td><td>{{e.root_name}}</td><td style="color:#64748b">{{e.detail}}</td><td>{{e.created_at}}</td></tr></tbody></table>
+        <p v-if="!events.length" style="color:#64748b;font-size:12px">暂无中断痕迹。</p>
       </div>
     </main>
   </div>`
